@@ -5,7 +5,7 @@ on:
       sha256:
         description: SHA256 of the published installer
         required: true
-        default: 6091cc31d063dd24b0f70474bd147d7fe58eca1b8aa6aae00c34ecc0f4f89aa0
+        default: c713e276c558bae568f2d6134bede8041511b38dd81c5ef42445156ab65a6bdc
 permissions:
   contents: read
 jobs:
@@ -17,6 +17,7 @@ jobs:
         shell: pwsh -NoProfile -Sta -File {0}
         env:
           EXPECTED_SHA256: ${{ inputs.sha256 }}
+          TEST_BIND_CODE: ${{ secrets.MISSDOG_QA_BIND_CODE }}
         run: |
           $ErrorActionPreference='Stop'
           $url='https://dog.xxlai.cc/miss-you-dog-0.1.0-windows-x64.exe'
@@ -57,13 +58,18 @@ jobs:
           }
           '@
           $script:app=$null
+          $script:qaIdentity=$null
           function Stop-TestApp {
             if($script:app -and -not $script:app.HasExited){Stop-Process -Id $script:app.Id -Force; $script:app.WaitForExit(5000) | Out-Null}
           }
           function Start-TestApp([Nullable[bool]]$autostart,[bool]$dnd) {
             Stop-TestApp
             if($null -eq $autostart){Remove-Item $stateFile -ErrorAction SilentlyContinue}
-            else {@{settings=@{autostart=[bool]$autostart;dnd=$dnd;always_on_top=$true}} | ConvertTo-Json -Depth 5 | Set-Content -Path $stateFile -Encoding utf8}
+            else {
+              $saved=if($script:qaIdentity){$script:qaIdentity|ConvertTo-Json -Depth 20|ConvertFrom-Json -AsHashtable}else{@{}}
+              $saved.settings=@{autostart=[bool]$autostart;dnd=$dnd;always_on_top=$true}
+              $saved|ConvertTo-Json -Depth 20|Set-Content -Path $stateFile -Encoding utf8
+            }
             Remove-Item $runtimeFile -ErrorAction SilentlyContinue
             $script:app=Start-Process -FilePath $exe -PassThru
           }
@@ -184,6 +190,34 @@ jobs:
             }
             if(-not $networkError){throw 'Installed WebView did not receive the expected HK binding response'}
             $result.checks+=@{name='installed_webview_hk_d1_error_path';passed=$true;response='binding code expired or used'}
+            if($env:TEST_BIND_CODE){
+              # One-use code comes only from an ephemeral Actions secret.
+              # No token or state is printed or uploaded from this VM.
+              foreach($edit in $edits){
+                if($edit.Current.Name -eq '主人给你的绑定码'){
+                  ([System.Windows.Automation.ValuePattern]$edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)).SetValue($env:TEST_BIND_CODE)
+                }
+              }
+              ([System.Windows.Automation.InvokePattern]$bindButton.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)).Invoke()
+              $r=Wait-Runtime {param($x) $x.client.role -eq 'friend' -and $x.client.queue_length -eq 0} 45
+              $priorEvents=@((Get-Content $stateFile -Raw|ConvertFrom-Json).recent|ForEach-Object {$_.client_event_id})
+              $cx=[int]$r.position.x+[int]($r.pet_size.width/2);$cy=[int]$r.position.y+[int]($r.pet_size.height/2)
+              [System.Windows.Forms.Cursor]::Position=[System.Drawing.Point]::new($cx,$cy)
+              $point=Pointer-Sample 'bound-click-before'
+              if(-not $point.cursor_read -or $point.root_pid -ne $script:app.Id){throw 'Bound pet click target not established'}
+              [NativeWindow]::mouse_event(2,0,0,0,[UIntPtr]::Zero)
+              Start-Sleep -Milliseconds 60
+              [NativeWindow]::mouse_event(4,0,0,0,[UIntPtr]::Zero)
+              $r=Wait-Runtime {param($x)
+                $saved=Get-Content $stateFile -Raw|ConvertFrom-Json
+                $script:normalEvent=$saved.recent|Where-Object {$_.level -eq 'normal' -and $_.client_event_id -notin $priorEvents}|Select-Object -First 1
+                $x.client.queue_length -eq 0 -and $script:normalEvent
+              } 45
+              $script:qaIdentity=Get-Content $stateFile -Raw|ConvertFrom-Json
+              $event=$script:normalEvent
+              if(-not $event -or $event.level -ne 'normal'){throw 'Actual pet click did not produce the expected normal event'}
+              $result.checks+=@{name='real_bound_friend_pet_click_roundtrip';passed=$true;binding_id=$script:qaIdentity.binding_id;client_event_id=$event.client_event_id;level=$event.level}
+            }
             $expectedRun='"'+$exe+'"'
             if((Get-RunValue).Trim() -ne $expectedRun){throw 'Default user Run command differs from installed exe'}
             if(Get-MachineRunValue){throw 'Machine-wide autostart must not be created'}
