@@ -148,24 +148,43 @@ jobs:
             Start-TestApp $null $false
             $form.Activate();[NativeWindow]::SetForegroundWindow($form.Handle) | Out-Null
             $r=Wait-Runtime {param($x) $x.autostart -eq $true -and $x.pet_visible -eq $true} 60
-            $names=@();$bindVisible=$false;$visibleEdits=0
+            $names=@();$bindVisible=$false;$visibleEdits=0;$bindButton=$null;$edits=@()
             for($i=0;$i -lt 30;$i++){
               $condition=[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ProcessIdProperty,[int]$script:app.Id)
               $windows=[System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children,$condition)
-              $names=@();$bindVisible=$false;$visibleEdits=0
+              $names=@();$bindVisible=$false;$visibleEdits=0;$bindButton=$null;$edits=@()
               foreach($w in $windows){
                 $names+=$w.Current.Name
                 $children=$w.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)
                 foreach($child in $children){
                   $current=$child.Current;$names+=$current.Name
-                  if(-not $current.IsOffscreen -and $current.ControlType -eq [System.Windows.Automation.ControlType]::Edit){$visibleEdits++}
-                  if(-not $current.IsOffscreen -and $current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and $current.Name -match '领回我的小狗'){$bindVisible=$true}
+                  if(-not $current.IsOffscreen -and $current.ControlType -eq [System.Windows.Automation.ControlType]::Edit){$visibleEdits++;$edits+=$child}
+                  if(-not $current.IsOffscreen -and $current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and $current.Name -match '领回我的小狗'){$bindVisible=$true;$bindButton=$child}
                 }
               }
               if($bindVisible -and $visibleEdits -ge 2){break}
               Start-Sleep -Seconds 1
             }
             if(-not $bindVisible -or $visibleEdits -lt 2){throw 'Visible onboarding Button and two Edit controls absent from UI Automation'}
+            # A deliberately invalid code tests the installed WebView -> HK -> D1
+            # error path without putting a user identity or credential in this repo.
+            foreach($edit in $edits){
+              $value=[System.Windows.Automation.ValuePattern]$edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+              if($edit.Current.Name -eq '你的昵称'){$value.SetValue('Windows QA')}
+              elseif($edit.Current.Name -eq '主人给你的绑定码'){$value.SetValue('QA-INVALID-DISPOSABLE')}
+            }
+            ([System.Windows.Automation.InvokePattern]$bindButton.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)).Invoke()
+            $networkError=$false
+            for($i=0;$i -lt 75;$i++){
+              $children=[System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Descendants,$condition)
+              foreach($window in $windows){
+                $text=$window.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)
+                foreach($node in $text){if($node.Current.Name -match '绑定码已使用或过期'){$networkError=$true;break}}
+              }
+              if($networkError){break};Start-Sleep -Milliseconds 200
+            }
+            if(-not $networkError){throw 'Installed WebView did not receive the expected HK binding response'}
+            $result.checks+=@{name='installed_webview_hk_d1_error_path';passed=$true;response='binding code expired or used'}
             $expectedRun='"'+$exe+'"'
             if((Get-RunValue).Trim() -ne $expectedRun){throw 'Default user Run command differs from installed exe'}
             if(Get-MachineRunValue){throw 'Machine-wide autostart must not be created'}
@@ -209,8 +228,9 @@ jobs:
             if(-not $point.left_down){throw 'Actual left-button down precondition not established'}
             for($i=1;$i -le 8;$i++){
               [System.Windows.Forms.Cursor]::Position=[System.Drawing.Point]::new($x-$i*10,$y-$i*6)
-              [System.Windows.Forms.Application]::DoEvents();Start-Sleep -Milliseconds 40
+              [System.Windows.Forms.Application]::DoEvents();Start-Sleep -Milliseconds 100
             }
+            Start-Sleep -Milliseconds 300
             $point=Pointer-Sample 'before-up'
             [NativeWindow]::mouse_event(4,0,0,0,[UIntPtr]::Zero)
             $r=Wait-Runtime {param($x) $x.position.x -ne $before.x -or $x.position.y -ne $before.y}
