@@ -73,7 +73,7 @@ jobs:
             $diag=[ordered]@{foreground_hwnd=$fg.ToInt64();foreground_class=$class.ToString();config=$config;files=@();runtime=$null;app_pid=$script:app.Id;main_window=$script:app.MainWindowTitle}
             if(Test-Path $config){$diag.files=@(Get-ChildItem $config | Select-Object Name,Length)}
             if(Test-Path $runtimeFile){try{$diag.runtime=Get-Content $runtimeFile -Raw | ConvertFrom-Json}catch{}}
-            foreach($name in @('startup.json','panel-error.json')){
+            foreach($name in @('startup.json','panel-error.json','drag.json')){
               $file=Join-Path $config $name
               if(Test-Path $file){try{$diag[$name]=Get-Content $file -Raw | ConvertFrom-Json}catch{}}
             }
