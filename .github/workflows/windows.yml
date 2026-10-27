@@ -46,6 +46,8 @@ jobs:
           public static class NativeWindow {
             [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
             [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+            [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder b, int n);
+            [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
           }
           '@
           $script:app=$null
@@ -58,6 +60,15 @@ jobs:
             Remove-Item $runtimeFile -ErrorAction SilentlyContinue
             $script:app=Start-Process -FilePath $exe -PassThru
           }
+          function Write-Diagnostics {
+            $fg=[NativeWindow]::GetForegroundWindow();$class=[System.Text.StringBuilder]::new(256)
+            [NativeWindow]::GetClassName($fg,$class,256) | Out-Null
+            $diag=[ordered]@{foreground_hwnd=$fg.ToInt64();foreground_class=$class.ToString();config=$config;files=@();runtime=$null;app_pid=$script:app.Id;main_window=$script:app.MainWindowTitle}
+            if(Test-Path $config){$diag.files=@(Get-ChildItem $config | Select-Object Name,Length)}
+            if(Test-Path $runtimeFile){try{$diag.runtime=Get-Content $runtimeFile -Raw | ConvertFrom-Json}catch{}}
+            $diag.run_value=Get-RunValue
+            Write-Output ('QA_DIAGNOSTIC '+($diag|ConvertTo-Json -Depth 8 -Compress))
+          }
           function Wait-Runtime([scriptblock]$condition,[int]$seconds=25) {
             $deadline=[DateTime]::UtcNow.AddSeconds($seconds)
             while([DateTime]::UtcNow -lt $deadline){
@@ -69,6 +80,7 @@ jobs:
               }
               Start-Sleep -Milliseconds 200
             }
+            Write-Diagnostics
             throw 'Native runtime condition timed out'
           }
           function Get-RunValue {
@@ -76,7 +88,17 @@ jobs:
           }
           $result=[ordered]@{installer_sha256=$actual;installer_bytes=(Get-Item $installer).Length;os=(Get-CimInstance Win32_OperatingSystem).Caption;checks=@()}
           try {
+            $form=New-Object System.Windows.Forms.Form
+            $form.FormBorderStyle=[System.Windows.Forms.FormBorderStyle]::None
+            $form.StartPosition=[System.Windows.Forms.FormStartPosition]::Manual
+            $normalBounds=[System.Drawing.Rectangle]::new(20,20,80,80)
+            $form.Bounds=$normalBounds
+            $form.TopMost=$true
+            $form.ShowInTaskbar=$false
+            $form.Show()
+            $form.Activate();[NativeWindow]::SetForegroundWindow($form.Handle) | Out-Null
             Start-TestApp $true $false
+            $form.Activate();[NativeWindow]::SetForegroundWindow($form.Handle) | Out-Null
             $r=Wait-Runtime {param($x) $x.autostart -eq $true -and $x.pet_visible -eq $true} 60
             $names=@()
             for($i=0;$i -lt 30;$i++){
@@ -94,12 +116,7 @@ jobs:
             if(($names -join '|') -notmatch '领回我的小狗'){throw 'Actual onboarding form absent from UI Automation'}
             if(-not (Get-RunValue)){throw 'Default autostart registry entry absent'}
             $result.checks+=@{name='install_and_real_onboarding';passed=$true;main_working_set_bytes=$script:app.WorkingSet64}
-            $form=New-Object System.Windows.Forms.Form
-            $form.FormBorderStyle=[System.Windows.Forms.FormBorderStyle]::None
             $form.Bounds=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-            $form.TopMost=$true
-            $form.ShowInTaskbar=$false
-            $form.Show()
             $form.Activate()
             [NativeWindow]::SetForegroundWindow($form.Handle) | Out-Null
             for($i=0;$i -lt 15 -and [NativeWindow]::GetForegroundWindow() -ne $form.Handle;$i++){
@@ -110,7 +127,8 @@ jobs:
             if([NativeWindow]::GetForegroundWindow() -ne $form.Handle){throw 'Fullscreen foreground precondition not established'}
             $r=Wait-Runtime {param($x) $x.foreground_fullscreen -eq $true -and $x.pet_visible -eq $false -and $x.dnd -eq $false}
             $result.checks+=@{name='actual_foreground_fullscreen_hides_pet';passed=$true;pid=$r.pid}
-            $form.Close();$form.Dispose();$form=$null
+            $form.Bounds=$normalBounds
+            $form.Activate();[NativeWindow]::SetForegroundWindow($form.Handle) | Out-Null
             $r=Wait-Runtime {param($x) $x.foreground_fullscreen -eq $false -and $x.pet_visible -eq $true}
             $result.checks+=@{name='fullscreen_exit_restores_pet';passed=$true;pid=$r.pid}
             Start-TestApp $false $false
@@ -124,6 +142,26 @@ jobs:
             Start-TestApp $true $false
             $r=Wait-Runtime {param($x) $x.dnd -eq $false -and $x.pet_visible -eq $true}
             $result.checks+=@{name='dnd_off_restores_pet';passed=$true}
+            # Actual pointer drag on this disposable VM, then read back native position.
+            $before=$r.position
+            $cursor=[System.Windows.Forms.Cursor]::Position
+            $x=[int]$before.x+[int]($r.pet_size.width/2);$y=[int]$before.y+[int]($r.pet_size.height/2)
+            [System.Windows.Forms.Cursor]::Position=[System.Drawing.Point]::new($x,$y)
+            [NativeWindow]::mouse_event(2,0,0,0,[UIntPtr]::Zero)
+            Start-Sleep -Milliseconds 100
+            for($i=1;$i -le 8;$i++){
+              [System.Windows.Forms.Cursor]::Position=[System.Drawing.Point]::new($x-$i*10,$y-$i*6)
+              [System.Windows.Forms.Application]::DoEvents();Start-Sleep -Milliseconds 40
+            }
+            [NativeWindow]::mouse_event(4,0,0,0,[UIntPtr]::Zero)
+            $r=Wait-Runtime {param($x) $x.position.x -ne $before.x -or $x.position.y -ne $before.y}
+            $moved=$r.position
+            Start-Sleep -Seconds 5
+            Start-TestApp $true $false
+            $r=Wait-Runtime {param($x) $x.pet_visible -eq $true}
+            if($r.position.x -ne $moved.x -or $r.position.y -ne $moved.y){throw 'Dragged position did not survive restart'}
+            [System.Windows.Forms.Cursor]::Position=$cursor
+            $result.checks+=@{name='actual_pointer_drag_and_position_restart';passed=$true;before=$before;after=$moved;restored=$r.position}
             $result.passed=$true
           } finally {
             if($form){$form.Close();$form.Dispose()}
