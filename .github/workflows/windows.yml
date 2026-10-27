@@ -67,6 +67,24 @@ jobs:
             $diag=[ordered]@{foreground_hwnd=$fg.ToInt64();foreground_class=$class.ToString();config=$config;files=@();runtime=$null;app_pid=$script:app.Id;main_window=$script:app.MainWindowTitle}
             if(Test-Path $config){$diag.files=@(Get-ChildItem $config | Select-Object Name,Length)}
             if(Test-Path $runtimeFile){try{$diag.runtime=Get-Content $runtimeFile -Raw | ConvertFrom-Json}catch{}}
+            foreach($name in @('startup.json','panel-error.json')){
+              $file=Join-Path $config $name
+              if(Test-Path $file){try{$diag[$name]=Get-Content $file -Raw | ConvertFrom-Json}catch{}}
+            }
+            try {
+              $pc=[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ProcessIdProperty,[int]$script:app.Id)
+              $ownWindows=[System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children,$pc)
+              $diag.ui=@()
+              foreach($window in $ownWindows){
+                $diag.ui+=@{name=$window.Current.Name;offscreen=$window.Current.IsOffscreen}
+                $controls=$window.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)
+                foreach($control in $controls){
+                  if($control.Current.ControlType -in @([System.Windows.Automation.ControlType]::Button,[System.Windows.Automation.ControlType]::Edit)){
+                    $diag.ui+=@{name=$control.Current.Name;type=$control.Current.ControlType.ProgrammaticName;offscreen=$control.Current.IsOffscreen}
+                  }
+                }
+              }
+            } catch {$diag.ui_error=$_.Exception.Message}
             $diag.run_value=Get-RunValue
             $diag.machine_run_value=Get-MachineRunValue
             Write-Host ('QA_DIAGNOSTIC '+($diag|ConvertTo-Json -Depth 8 -Compress))
