@@ -1,0 +1,133 @@
+name: Test published Windows installer
+on:
+  workflow_dispatch:
+    inputs:
+      sha256:
+        description: SHA256 of the published installer
+        required: true
+        default: 17cc56ff5d47e3c01aa1bd8588e60b76f5b3b22651dcdee796b67a5579e09b1d
+permissions:
+  contents: read
+jobs:
+  native-installer:
+    runs-on: windows-latest
+    timeout-minutes: 8
+    steps:
+      - name: Install and exercise published desktop application
+        shell: pwsh -NoProfile -Sta -File {0}
+        env:
+          EXPECTED_SHA256: ${{ inputs.sha256 }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $url='https://dog.xxlai.cc/miss-you-dog-0.1.0-windows-x64.exe'
+          if($env:EXPECTED_SHA256 -notmatch '^[a-fA-F0-9]{64}$'){throw 'Invalid checksum input'}
+          $installer=Join-Path $env:RUNNER_TEMP 'missdog-setup.exe'
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $actual=(Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($actual -ne $env:EXPECTED_SHA256.ToLowerInvariant()){throw 'Installer SHA mismatch'}
+          $installDir=Join-Path $env:RUNNER_TEMP 'missdog-installed'
+          $setup=Start-Process -FilePath $installer -ArgumentList '/S',"/D=$installDir" -Wait -PassThru
+          if($setup.ExitCode -ne 0){throw "Installer failed: $($setup.ExitCode)"}
+          $exe=(Get-ChildItem $installDir -Recurse -Filter miss-you-dog.exe | Select-Object -First 1).FullName
+          if(-not $exe){throw 'Installed executable missing'}
+          $config=Join-Path $env:APPDATA 'cc.xxlai.miss-you-dog'
+          New-Item -ItemType Directory -Force $config | Out-Null
+          $runtimeFile=Join-Path $config 'runtime.json'
+          $stateFile=Join-Path $config 'state.json'
+          $runPath='HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+          $runName='想念小狗'
+          $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS='--force-renderer-accessibility'
+          Add-Type -AssemblyName UIAutomationClient
+          Add-Type -AssemblyName UIAutomationTypes
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class NativeWindow {
+            [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+            [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+          }
+          '@
+          $script:app=$null
+          function Stop-TestApp {
+            if($script:app -and -not $script:app.HasExited){Stop-Process -Id $script:app.Id -Force; $script:app.WaitForExit(5000) | Out-Null}
+          }
+          function Start-TestApp([bool]$autostart,[bool]$dnd) {
+            Stop-TestApp
+            @{settings=@{autostart=$autostart;dnd=$dnd;always_on_top=$true}} | ConvertTo-Json -Depth 5 | Set-Content -Path $stateFile -Encoding utf8
+            Remove-Item $runtimeFile -ErrorAction SilentlyContinue
+            $script:app=Start-Process -FilePath $exe -PassThru
+          }
+          function Wait-Runtime([scriptblock]$condition,[int]$seconds=25) {
+            $deadline=[DateTime]::UtcNow.AddSeconds($seconds)
+            while([DateTime]::UtcNow -lt $deadline){
+              [System.Windows.Forms.Application]::DoEvents()
+              if($script:app.HasExited){throw 'Application exited'}
+              if(Test-Path $runtimeFile){
+                try {$r=Get-Content $runtimeFile -Raw | ConvertFrom-Json} catch {$r=$null}
+                if($r -and $r.pid -eq $script:app.Id -and (& $condition $r)){return $r}
+              }
+              Start-Sleep -Milliseconds 200
+            }
+            throw 'Native runtime condition timed out'
+          }
+          function Get-RunValue {
+            try {Get-ItemPropertyValue -Path $runPath -Name $runName -ErrorAction Stop} catch {$null}
+          }
+          $result=[ordered]@{installer_sha256=$actual;installer_bytes=(Get-Item $installer).Length;os=(Get-CimInstance Win32_OperatingSystem).Caption;checks=@()}
+          try {
+            Start-TestApp $true $false
+            $r=Wait-Runtime {param($x) $x.autostart -eq $true -and $x.pet_visible -eq $true} 60
+            $names=@()
+            for($i=0;$i -lt 30;$i++){
+              $condition=[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ProcessIdProperty,[int]$script:app.Id)
+              $windows=[System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children,$condition)
+              $names=@()
+              foreach($w in $windows){
+                $names+=$w.Current.Name
+                $children=$w.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)
+                foreach($child in $children){$names+=$child.Current.Name}
+              }
+              if(($names -join '|') -match '领回我的小狗'){break}
+              Start-Sleep -Seconds 1
+            }
+            if(($names -join '|') -notmatch '领回我的小狗'){throw 'Actual onboarding form absent from UI Automation'}
+            if(-not (Get-RunValue)){throw 'Default autostart registry entry absent'}
+            $result.checks+=@{name='install_and_real_onboarding';passed=$true;main_working_set_bytes=$script:app.WorkingSet64}
+            $form=New-Object System.Windows.Forms.Form
+            $form.FormBorderStyle=[System.Windows.Forms.FormBorderStyle]::None
+            $form.Bounds=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $form.TopMost=$true
+            $form.ShowInTaskbar=$false
+            $form.Show()
+            $form.Activate()
+            [NativeWindow]::SetForegroundWindow($form.Handle) | Out-Null
+            for($i=0;$i -lt 15 -and [NativeWindow]::GetForegroundWindow() -ne $form.Handle;$i++){
+              [System.Windows.Forms.Application]::DoEvents()
+              $form.Activate();[NativeWindow]::SetForegroundWindow($form.Handle) | Out-Null
+              Start-Sleep -Milliseconds 200
+            }
+            if([NativeWindow]::GetForegroundWindow() -ne $form.Handle){throw 'Fullscreen foreground precondition not established'}
+            $r=Wait-Runtime {param($x) $x.foreground_fullscreen -eq $true -and $x.pet_visible -eq $false -and $x.dnd -eq $false}
+            $result.checks+=@{name='actual_foreground_fullscreen_hides_pet';passed=$true;pid=$r.pid}
+            $form.Close();$form.Dispose();$form=$null
+            $r=Wait-Runtime {param($x) $x.foreground_fullscreen -eq $false -and $x.pet_visible -eq $true}
+            $result.checks+=@{name='fullscreen_exit_restores_pet';passed=$true;pid=$r.pid}
+            Start-TestApp $false $false
+            $r=Wait-Runtime {param($x) $x.autostart -eq $false}
+            if(Get-RunValue){throw 'Disabled autostart still registered'}
+            $result.checks+=@{name='saved_autostart_off_removes_registry';passed=$true}
+            Start-TestApp $true $true
+            $r=Wait-Runtime {param($x) $x.autostart -eq $true -and $x.dnd -eq $true -and $x.pet_visible -eq $false}
+            if(-not (Get-RunValue)){throw 'Enabled autostart registry missing'}
+            $result.checks+=@{name='saved_autostart_on_and_dnd_hide';passed=$true}
+            Start-TestApp $true $false
+            $r=Wait-Runtime {param($x) $x.dnd -eq $false -and $x.pet_visible -eq $true}
+            $result.checks+=@{name='dnd_off_restores_pet';passed=$true}
+            $result.passed=$true
+          } finally {
+            if($form){$form.Close();$form.Dispose()}
+            Stop-TestApp
+            Remove-ItemProperty -Path $runPath -Name $runName -ErrorAction SilentlyContinue
+            Write-Output ('QA_RESULT '+($result | ConvertTo-Json -Depth 8 -Compress))
+          }
