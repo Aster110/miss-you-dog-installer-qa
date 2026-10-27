@@ -176,7 +176,6 @@ jobs:
             ([System.Windows.Automation.InvokePattern]$bindButton.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)).Invoke()
             $networkError=$false
             for($i=0;$i -lt 75;$i++){
-              $children=[System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Descendants,$condition)
               foreach($window in $windows){
                 $text=$window.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)
                 foreach($node in $text){if($node.Current.Name -match '绑定码已使用或过期'){$networkError=$true;break}}
@@ -189,6 +188,14 @@ jobs:
             if((Get-RunValue).Trim() -ne $expectedRun){throw 'Default user Run command differs from installed exe'}
             if(Get-MachineRunValue){throw 'Machine-wide autostart must not be created'}
             $result.checks+=@{name='install_default_autostart_and_visible_onboarding';passed=$true;visible_edits=$visibleEdits;visible_bind_button=$bindVisible;main_working_set_bytes=$script:app.WorkingSet64}
+            # UIA Invoke makes the app the foreground process. Restore the
+            # test form via an actual click on its unobstructed client area so
+            # Windows foreground-lock policy has a real input precondition.
+            [System.Windows.Forms.Cursor]::Position=[System.Drawing.Point]::new(40,40)
+            [NativeWindow]::mouse_event(2,0,0,0,[UIntPtr]::Zero)
+            Start-Sleep -Milliseconds 60
+            [NativeWindow]::mouse_event(4,0,0,0,[UIntPtr]::Zero)
+            [System.Windows.Forms.Application]::DoEvents()
             $form.Bounds=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds
             $form.Activate()
             [NativeWindow]::SetForegroundWindow($form.Handle) | Out-Null
