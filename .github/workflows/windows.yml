@@ -5,7 +5,7 @@ on:
       sha256:
         description: SHA256 of the published installer
         required: true
-        default: 17cc56ff5d47e3c01aa1bd8588e60b76f5b3b22651dcdee796b67a5579e09b1d
+        default: 6fe60ed8e362663055171a159af16fde7c786afa41851fec2fd6e45f66e70d07
 permissions:
   contents: read
 jobs:
@@ -54,9 +54,10 @@ jobs:
           function Stop-TestApp {
             if($script:app -and -not $script:app.HasExited){Stop-Process -Id $script:app.Id -Force; $script:app.WaitForExit(5000) | Out-Null}
           }
-          function Start-TestApp([bool]$autostart,[bool]$dnd) {
+          function Start-TestApp([Nullable[bool]]$autostart,[bool]$dnd) {
             Stop-TestApp
-            @{settings=@{autostart=$autostart;dnd=$dnd;always_on_top=$true}} | ConvertTo-Json -Depth 5 | Set-Content -Path $stateFile -Encoding utf8
+            if($null -eq $autostart){Remove-Item $stateFile -ErrorAction SilentlyContinue}
+            else {@{settings=@{autostart=[bool]$autostart;dnd=$dnd;always_on_top=$true}} | ConvertTo-Json -Depth 5 | Set-Content -Path $stateFile -Encoding utf8}
             Remove-Item $runtimeFile -ErrorAction SilentlyContinue
             $script:app=Start-Process -FilePath $exe -PassThru
           }
@@ -67,7 +68,8 @@ jobs:
             if(Test-Path $config){$diag.files=@(Get-ChildItem $config | Select-Object Name,Length)}
             if(Test-Path $runtimeFile){try{$diag.runtime=Get-Content $runtimeFile -Raw | ConvertFrom-Json}catch{}}
             $diag.run_value=Get-RunValue
-            Write-Output ('QA_DIAGNOSTIC '+($diag|ConvertTo-Json -Depth 8 -Compress))
+            $diag.machine_run_value=Get-MachineRunValue
+            Write-Host ('QA_DIAGNOSTIC '+($diag|ConvertTo-Json -Depth 8 -Compress))
           }
           function Wait-Runtime([scriptblock]$condition,[int]$seconds=25) {
             $deadline=[DateTime]::UtcNow.AddSeconds($seconds)
@@ -84,7 +86,19 @@ jobs:
             throw 'Native runtime condition timed out'
           }
           function Get-RunValue {
-            try {Get-ItemPropertyValue -Path $runPath -Name $runName -ErrorAction Stop} catch {$null}
+            if(-not (Test-Path $runPath)){return $null}
+            $values=Get-ItemProperty -Path $runPath
+            $startupEntries=@($values.PSObject.Properties | Where-Object {$_.Value -is [string] -and $_.Value.Contains($exe)})
+            if($startupEntries.Count -gt 1){throw 'Multiple user Run entries target this executable'}
+            if($startupEntries.Count -eq 0){return $null}
+            $script:runName=$startupEntries[0].Name
+            return $startupEntries[0].Value
+          }
+          function Get-MachineRunValue {
+            $machinePath='HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'
+            if(-not (Test-Path $machinePath)){return $null}
+            $values=Get-ItemProperty -Path $machinePath
+            @($values.PSObject.Properties | Where-Object {$_.Value -is [string] -and $_.Value.Contains($exe)} | ForEach-Object {$_.Value})
           }
           $result=[ordered]@{installer_sha256=$actual;installer_bytes=(Get-Item $installer).Length;os=(Get-CimInstance Win32_OperatingSystem).Caption;checks=@()}
           try {
@@ -97,25 +111,31 @@ jobs:
             $form.ShowInTaskbar=$false
             $form.Show()
             $form.Activate();[NativeWindow]::SetForegroundWindow($form.Handle) | Out-Null
-            Start-TestApp $true $false
+            Start-TestApp $null $false
             $form.Activate();[NativeWindow]::SetForegroundWindow($form.Handle) | Out-Null
             $r=Wait-Runtime {param($x) $x.autostart -eq $true -and $x.pet_visible -eq $true} 60
-            $names=@()
+            $names=@();$bindVisible=$false;$visibleEdits=0
             for($i=0;$i -lt 30;$i++){
               $condition=[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ProcessIdProperty,[int]$script:app.Id)
               $windows=[System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children,$condition)
-              $names=@()
+              $names=@();$bindVisible=$false;$visibleEdits=0
               foreach($w in $windows){
                 $names+=$w.Current.Name
                 $children=$w.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)
-                foreach($child in $children){$names+=$child.Current.Name}
+                foreach($child in $children){
+                  $current=$child.Current;$names+=$current.Name
+                  if(-not $current.IsOffscreen -and $current.ControlType -eq [System.Windows.Automation.ControlType]::Edit){$visibleEdits++}
+                  if(-not $current.IsOffscreen -and $current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and $current.Name -match '领回我的小狗'){$bindVisible=$true}
+                }
               }
-              if(($names -join '|') -match '领回我的小狗'){break}
+              if($bindVisible -and $visibleEdits -ge 2){break}
               Start-Sleep -Seconds 1
             }
-            if(($names -join '|') -notmatch '领回我的小狗'){throw 'Actual onboarding form absent from UI Automation'}
-            if(-not (Get-RunValue)){throw 'Default autostart registry entry absent'}
-            $result.checks+=@{name='install_and_real_onboarding';passed=$true;main_working_set_bytes=$script:app.WorkingSet64}
+            if(-not $bindVisible -or $visibleEdits -lt 2){throw 'Visible onboarding Button and two Edit controls absent from UI Automation'}
+            $expectedRun='"'+$exe+'"'
+            if((Get-RunValue).Trim() -ne $expectedRun){throw 'Default user Run command differs from installed exe'}
+            if(Get-MachineRunValue){throw 'Machine-wide autostart must not be created'}
+            $result.checks+=@{name='install_default_autostart_and_visible_onboarding';passed=$true;visible_edits=$visibleEdits;visible_bind_button=$bindVisible;main_working_set_bytes=$script:app.WorkingSet64}
             $form.Bounds=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds
             $form.Activate()
             [NativeWindow]::SetForegroundWindow($form.Handle) | Out-Null
@@ -137,7 +157,7 @@ jobs:
             $result.checks+=@{name='saved_autostart_off_removes_registry';passed=$true}
             Start-TestApp $true $true
             $r=Wait-Runtime {param($x) $x.autostart -eq $true -and $x.dnd -eq $true -and $x.pet_visible -eq $false}
-            if(-not (Get-RunValue)){throw 'Enabled autostart registry missing'}
+            if((Get-RunValue).Trim() -ne $expectedRun){throw 'Enabled user Run command differs from installed exe'}
             $result.checks+=@{name='saved_autostart_on_and_dnd_hide';passed=$true}
             Start-TestApp $true $false
             $r=Wait-Runtime {param($x) $x.dnd -eq $false -and $x.pet_visible -eq $true}
@@ -164,6 +184,7 @@ jobs:
             $result.checks+=@{name='actual_pointer_drag_and_position_restart';passed=$true;before=$before;after=$moved;restored=$r.position}
             $result.passed=$true
           } finally {
+            try {Write-Diagnostics} catch {Write-Host ('QA_DIAGNOSTIC_ERROR '+$_.Exception.Message)}
             if($form){$form.Close();$form.Dispose()}
             Stop-TestApp
             Remove-ItemProperty -Path $runPath -Name $runName -ErrorAction SilentlyContinue
