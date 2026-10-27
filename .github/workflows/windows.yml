@@ -51,6 +51,7 @@ jobs:
             [DllImport("user32.dll")] public static extern bool GetCursorPos(out Point p);
             [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
             [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(Point p);
+            [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
             [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
             [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
           }
@@ -98,7 +99,9 @@ jobs:
             $p=[NativeWindow+Point]::new();$ok=[NativeWindow]::GetCursorPos([ref]$p)
             $h=[NativeWindow]::WindowFromPoint($p);[uint32]$target=0
             [NativeWindow]::GetWindowThreadProcessId($h,[ref]$target) | Out-Null
-            $row=@{phase=$phase;cursor_read=$ok;x=$p.X;y=$p.Y;left_down=([NativeWindow]::GetAsyncKeyState(1) -lt 0);target_pid=$target;app_pid=$script:app.Id}
+            $root=[NativeWindow]::GetAncestor($h,2);[uint32]$rootPid=0
+            [NativeWindow]::GetWindowThreadProcessId($root,[ref]$rootPid) | Out-Null
+            $row=@{root_pid=$rootPid;phase=$phase;cursor_read=$ok;x=$p.X;y=$p.Y;left_down=([NativeWindow]::GetAsyncKeyState(1) -lt 0);target_pid=$target;app_pid=$script:app.Id}
             Write-Host ('QA_POINTER '+($row|ConvertTo-Json -Compress))
             return $row
           }
@@ -199,7 +202,7 @@ jobs:
             $x=[int]$before.x+[int]($r.pet_size.width/2);$y=[int]$before.y+[int]($r.pet_size.height/2)
             [System.Windows.Forms.Cursor]::Position=[System.Drawing.Point]::new($x,$y)
             $point=Pointer-Sample 'before-down'
-            if(-not $point.cursor_read -or $point.x -ne $x -or $point.y -ne $y -or $point.target_pid -ne $script:app.Id){throw 'Actual pointer target precondition not established'}
+            if(-not $point.cursor_read -or $point.x -ne $x -or $point.y -ne $y -or $point.root_pid -ne $script:app.Id){throw 'Actual pointer target precondition not established'}
             [NativeWindow]::mouse_event(2,0,0,0,[UIntPtr]::Zero)
             Start-Sleep -Milliseconds 100
             $point=Pointer-Sample 'after-down'
