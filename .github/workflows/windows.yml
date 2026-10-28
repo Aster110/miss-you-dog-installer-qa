@@ -226,17 +226,24 @@ jobs:
               $transform=[System.Windows.Automation.TransformPattern]$panel.GetCurrentPattern([System.Windows.Automation.TransformPattern]::Pattern)
               $transform.Resize(700,520)
               Start-Sleep -Milliseconds 700
-              $all=$panel.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)
               $required=@('改备注','寄出去 ↗','想你 +1 ♡','查看更早七天')
               $found=@();$remarkButton=$null;$bounds=$panel.Current.BoundingRectangle
-              foreach($node in $all){
-                $name=$node.Current.Name
-                if($name -in $required){
-                  $rect=$node.Current.BoundingRectangle
-                  if($node.Current.IsOffscreen -or $rect.Bottom -gt $bounds.Bottom -or $rect.Top -lt $bounds.Top){throw 'Main operation clipped at minimum window size'}
-                  $found+=$name
+              # Role/auth arrives before the asynchronous relationship/history RPCs.
+              # Wait for the actual dashboard instead of asserting on its loading state.
+              for($ready=0;$ready -lt 180;$ready++){
+                $all=$panel.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)
+                $found=@()
+                foreach($node in $all){
+                  $name=$node.Current.Name
+                  if($name -in $required){
+                    $rect=$node.Current.BoundingRectangle
+                    if($node.Current.IsOffscreen -or $rect.Bottom -gt $bounds.Bottom -or $rect.Top -lt $bounds.Top){throw 'Main operation clipped at minimum window size'}
+                    $found+=$name
+                  }
+                  if($name -eq '改备注'){$remarkButton=$node}
                 }
-                if($name -eq '改备注'){$remarkButton=$node}
+                if($found.Count -eq $required.Count){break}
+                Start-Sleep -Milliseconds 200
               }
               foreach($name in $required){if($name -notin $found){throw ('Missing operation '+$name)}}
               $result.checks+=@{name='installed_single_screen_minimum_700x520';passed=$true;visible_operations=$found}
